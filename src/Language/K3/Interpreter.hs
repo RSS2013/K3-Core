@@ -884,7 +884,13 @@ runExpression_ e = runExpression e >>= putStrLn . show
 runProgram :: SystemEnvironment -> K3 Declaration -> IO ()
 runProgram systemEnv prog = do
     engine <- simulationEngine systemEnv syntaxValueWD
-    void $ flip runEngineM engine $ runEngine virtualizedProcessor systemEnv prog
+    status <- flip runEngineM engine $ runEngine virtualizedProcessor systemEnv prog
+    void $ either (err) (const success) status
+      where 
+       err :: EngineError -> IO ()
+       err e  = putStrLn $ "There was an EngineError: " ++ (getMessage e)
+       success = putStrLn "Program Ran Successfully!"
+
 
 -- | Single-machine network deployment.
 --   Takes a system deployment and forks a network engine for each peer.

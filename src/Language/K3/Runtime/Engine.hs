@@ -67,6 +67,7 @@ module Language.K3.Runtime.Engine (
   , putMessageQueues
   , putEngine
 
+  , getMessage
 #ifdef TEST
   , EngineControl(..)
   , LoopStatus(..)
@@ -134,11 +135,12 @@ import Control.Concurrent.MVar
 import Control.Concurrent.MSampleVar
 import qualified Control.Concurrent.MSem as MSem
 import Control.Concurrent.MSem (MSem)
-import Control.Exception (throwIO)
+import Control.Exception (throwIO,try)
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Either
+
 
 import qualified Data.ByteString.Char8 as BS
 import Data.Functor
@@ -152,6 +154,7 @@ import Debug.Trace
 import qualified System.IO as SIO
 import System.Process
 import System.Mem.Weak (Weak)
+import System.IO.Error
 
 import Text.Read hiding (lift)
 
@@ -183,11 +186,17 @@ data Engine a = Engine { config          :: EngineConfiguration
                        , endpoints       :: EEndpointState a
                        , connections     :: EConnectionState }
 
-data EngineError = EngineError
+data EngineError = EngineError {message :: String}
+
+getMessage :: EngineError -> String
+getMessage e = message e
 
 type EngineT e r m = EitherT e (ReaderT r m)
 
 type EngineM a = EngineT EngineError (Engine a) IO
+
+throwE :: EngineError -> EngineM a b
+throwE = Control.Monad.Trans.Either.left
 
 runEngineT :: EngineT e r m a -> r -> m (Either e a)
 runEngineT s r = flip runReaderT r $ runEitherT s
@@ -777,12 +786,14 @@ genericOpenBuiltin eid (builtin -> b) wd eps = do
 genericOpenFile :: Identifier -> String -> WireDesc a -> Maybe (K3 Type) -> String -> EEndpoints a b
     -> EngineM b ()
 genericOpenFile eid path wd _ mode eps = do
-    file <- liftIO $ openFileHandle path wd (ioMode mode)
+    file <- (liftIO $ tryIOError $ openFileHandle path wd (ioMode mode)) >>= either (const err) return
+    --file <- liftIO $ openFileHandle path wd (ioMode mode)
     let buffer = Exclusive emptySingletonBuffer
     void $ addEndpoint eid (file, buffer, []) eps
     case ioMode mode of
         SIO.ReadMode -> void $ genericDoRead eid eps -- Prime the file's buffer.
         _ -> return ()
+    where err = throwE $ EngineError $ "Unable to Open File: " ++ path
 
 -- | Socket endpoint constructor.
 --   This initializes the engine's connections as necessary.
@@ -958,7 +969,8 @@ networkSink _ = Nothing
 
 -- | Open an external file, with given wire description and file path.
 openFileHandle :: FilePath -> WireDesc a -> SIO.IOMode -> IO (IOHandle a)
-openFileHandle p wd mode = SIO.openFile p mode >>= return . FileH wd
+openFileHandle p wd mode = 
+  SIO.openFile p mode >>= return . FileH wd
 
 -- | Open an external socket, with given wire description and address.
 openSocketHandle :: Address -> WireDesc a -> SIO.IOMode -> Maybe (MVar EConnectionMap)
