@@ -135,7 +135,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.MSampleVar
 import qualified Control.Concurrent.MSem as MSem
 import Control.Concurrent.MSem (MSem)
-import Control.Exception (throwIO)
+import Control.Exception (throwIO,try)
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.IO.Class
@@ -185,7 +185,12 @@ data Engine a = Engine { config          :: EngineConfiguration
                        , endpoints       :: EEndpointState a
                        , connections     :: EConnectionState }
 
-data EngineError = EngineError String deriving (Eq, Read, Show)
+data EngineError = EndpointError     {message :: String} 
+                 | ConnectionError   {message :: String} 
+                 | HandleError       {message :: String}
+                 | MessagesError     {message :: String}
+                 | EngineError       {message :: String}  
+                 deriving (Eq, Read, Show)
 
 type EngineT e r m = EitherT e (ReaderT r m)
 
@@ -586,7 +591,7 @@ runMessages :: (Pretty r, Pretty e, Show a)
             => MessageProcessor i p a r e -> EngineM a (LoopStatus r e) -> EngineM a ()
 runMessages mp status = ask >>= \engine -> status >>= \case
     Result r       -> debugStep >> runMessages mp (processMessage mp r)
-    Error e        -> die "Error:" e (control engine)
+    Error e        -> err "Error:" e (control engine)
     MessagesDone r -> terminate >>= \case
         True -> do
             fr <- finalize mp r
@@ -602,7 +607,13 @@ runMessages mp status = ask >>= \engine -> status >>= \case
         cleanupEngine
         liftIO $ tryPutMVar (waitV cntrl) ()
         logStep $ "Finished."
-
+    
+    err msg r cntrl = do
+        cleanupEngine
+        liftIO $ tryPutMVar (waitV cntrl) ()
+        logStep $ "Finished."
+        throwEngineError $ MessagesError $ msg ++ (pretty r)
+    
     logStep s = void $ _notice_EngineSteps $ s
 
 runEngine :: (Pretty r, Pretty e, Show a) => MessageProcessor i p a r e -> i -> p -> EngineM a ()
@@ -686,9 +697,9 @@ runNEndpoint ls ep@(Endpoint h@(networkSource -> Just(wd,llep)) _ subs) = do
                     ls -> return (b, ls ++ [PropagatedError mg])
 
     summarize l = "Endpoint message errors (runNEndpoint " ++ (name ls) ++ ", " ++ show (length l) ++ " messages)"
-    endpointError s = close (name ls) >> (liftIO $ putStrLn s) -- TODO: close vs closeInternal
+    endpointError s = close (name ls) >> (throwEngineError $ EndpointError $ s) -- TODO: close vs closeInternal
 
-runNEndpoint ls _ = error $ "Invalid endpoint for network source " ++ (name ls)
+runNEndpoint ls _ = throwEngineError $ EndpointError $ "Invalid endpoint for network source " ++ (name ls)
 
 {- Message passing -}
 
@@ -741,7 +752,7 @@ send addr n arg = do
         then enqueue (queues engine) addr n arg
         else trySend (connectionRetries $ config engine)
   where
-    trySend 0 = send' (connectionId addr) $ error $ "Failed to connect to " ++ show addr
+    trySend 0 = send' (connectionId addr) $ throwEngineError $ EngineError $ "Failed to connect to " ++ show addr
     trySend i = send' (connectionId addr) $ trySend $ i - 1
 
     send' eid retryF = do
@@ -751,7 +762,7 @@ send addr n arg = do
             Nothing -> openSocketInternal eid addr "w" >> retryF
 
     write eid (Just True) = doWriteInternal eid (addr, n, arg)
-    write _ _             = error $ "No write available to " ++ show addr
+    write _ _             = throwEngineError $ EngineError $ "No write available to " ++ show addr
 
 {- Module API implementation -}
 
@@ -790,13 +801,15 @@ genericOpenFile :: Identifier -> String -> WireDesc a -> Maybe (K3 Type)
                 -> String -> EEndpoints a b
                 -> EngineM b ()
 genericOpenFile eid path wd _ mode eps = do
-    file <- liftIO $ openFileHandle path wd (ioMode mode)
+    file <- (liftIO $ try $ openFileHandle path wd (ioMode mode)) >>= either err return  
     let buffer = Just $ Exclusive emptySingletonBuffer
     void $ addEndpoint eid (file, buffer, []) eps
     case ioMode mode of
         SIO.ReadMode -> void $ genericDoRead eid eps -- Prime the file's buffer.
         _ -> return ()
-
+    where 
+      err :: IOError -> EngineM b (IOHandle a)
+      err e = throwEngineError $ HandleError $ "Could not open file: " ++ (show e)
 -- | Socket endpoint constructor.
 --   This initializes the engine's connections as necessary.
 -- TODO: validation with the given type
@@ -922,7 +935,7 @@ genericDoWrite n arg endpoints = getEndpoint n endpoints >>= maybe (return ()) w
 
     overflowError =
       genericClose n endpoints
-        >> (liftIO $ putStrLn "Endpoint buffer overflow (doWrite)")
+        >> (throwEngineError $ HandleError $ "Endpoint buffer overflow (doWrite)")
 
 
 {- External endpoint methods -}
@@ -1025,13 +1038,13 @@ openSocketHandle addr wd mode conns =
   case mode of
     SIO.ReadMode      -> incoming
     SIO.WriteMode     -> outgoing
-    SIO.AppendMode    -> error "Unsupported network handle mode"
-    SIO.ReadWriteMode -> error "Unsupport network handle mode"
+    SIO.AppendMode    -> throwEngineError $ HandleError $ "Unsupported network handle mode"
+    SIO.ReadWriteMode -> throwEngineError $ HandleError $ "Unsupport network handle mode"
 
   where incoming = newEndpoint addr >>= return . (>>= return . SocketH wd . Left)
         outgoing = case conns of
           Just c  -> getEstablishedConnection addr c >>= return . (>>= return . SocketH wd . Right)
-          Nothing -> error "Invalid outgoing network connection map"
+          Nothing -> throwEngineError $ HandleError $ "Invalid outgoing network connection map"
 
 -- | Close an external.
 closeHandle :: IOHandle a -> EngineM b ()
@@ -1041,7 +1054,7 @@ closeHandle (networkSource -> Just (_,ep)) = closeEndpoint ep
 closeHandle (networkSink   -> Just (_,_))  = return ()
   -- TODO: above, reference count aggregated outgoing connections for garbage collection
 
-closeHandle _ = error "Invalid IOHandle argument for closeHandle"
+closeHandle _ = throwEngineError $ HandleError $ "Invalid IOHandle argument for closeHandle"
 
 -- | Read a single payload from an external.
 readHandle :: IOHandle a -> IO (Maybe a)
@@ -1083,11 +1096,12 @@ writeHandle payload = \case
 {- Endpoint accessors -}
 
 newEndpoint :: Address -> EngineM a (Maybe NEndpoint)
-newEndpoint (Address (host, port)) = liftIO . withSocketsDo $ do
-  t <- eitherAsMaybe $ NTTCP.createTransport host (show port) NTTCP.defaultTCPParameters
-  e <- maybe (return Nothing) (eitherAsMaybe . NT.newEndPoint) t
-  return $ t >>= \tr -> e >>= return . flip NEndpoint tr
-  where eitherAsMaybe m = m >>= return . either (\_ -> Nothing) Just
+newEndpoint (Address (host, port)) = do
+  t <- (liftIO $ withSocketsDo $ do NTTCP.createTransport host (show port) NTTCP.defaultTCPParameters) >>= either (err) return
+  e <- (liftIO $ withSocketsDo $ do NT.newEndPoint t) >>= either (err) return
+  return $ Just $ NEndpoint e t
+  where
+     err e = throwEngineError $ EndpointError $ "Unable to create new endpoint:" ++ (show e)
 
 closeEndpoint :: NEndpoint -> EngineM a ()
 closeEndpoint ep = liftIO $ NT.closeEndPoint (endpoint ep) >> NT.closeTransport (epTransport ep)
@@ -1113,11 +1127,11 @@ llAddress addr = NT.EndPointAddress $ BS.pack $ show addr ++ ":0"
     -- TODO: above, check if it is safe to always use ":0" for NT.EndPointAddress
 
 newConnection :: Address -> NEndpoint -> EngineM a (Maybe NConnection)
-newConnection addr (endpoint -> ep) = liftIO $
-  NT.connect ep (llAddress addr) NT.ReliableOrdered NT.defaultConnectHints
-    >>= either connectionError connectionSuccess
+newConnection addr (endpoint -> ep) = do
+   attempt <- liftIO $ NT.connect ep (llAddress addr) NT.ReliableOrdered NT.defaultConnectHints
+   either connectionError connectionSuccess attempt
   where connectionSuccess   = return . Just . flip NConnection addr
-        connectionError err = return Nothing
+        connectionError err = throwEngineError $ ConnectionError $ (show err)
 
 emptyConnectionMap :: Address -> IO (MVar EConnectionMap)
 emptyConnectionMap addr = liftIO $ newMVar $ EConnectionMap { anchor = (addr, Nothing), cache = [] }
