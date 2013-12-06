@@ -11,6 +11,7 @@ import Control.Monad.Trans.Either
 
 import Data.Functor
 import Data.Maybe
+import Data.List (nub)
 
 import qualified Data.Map as M
 import qualified Data.Set as S
@@ -148,6 +149,7 @@ cType (tag &&& children -> (TTuple, [])) = return $ text "unit_t"
 cType (tag &&& children -> (TTuple, ts))
     = (text "tuple" <>) . angles . sep . punctuate comma <$> mapM cType ts
 cType t@(tag -> TRecord _) = text <$> signature t
+cType (tag -> TDeclaredVar t) = return $ text t
 
 -- TODO: Three pieces of information necessary to generate a collection type:
 --  1. The list of named annotations on the collections.
@@ -341,10 +343,58 @@ declaration _ = return empty
 reserved :: [Identifier]
 reserved = ["openBuiltin"]
 
+composite :: Identifier -> [(Identifier, [AnnMemDecl])] -> CPPGenM CPPGenR
+composite cName ans = do
+    members <- vsep <$> mapM annMemDecl positives
+    return $ text "class" <+> text cName <+> braces members
+  where
+    onlyPositives :: AnnMemDecl -> Bool
+    onlyPositives (Lifted Provides _ _ _ _) = True
+    onlyPositives (Attribute Provides _ _ _ _) = True
+    onlyPositives (MAnnotation Provides _ _) = True
+    onlypositives _ = False
+
+    positives = filter onlyPositives (concat . snd $ unzip ans)
+
+annMemDecl :: AnnMemDecl -> CPPGenM CPPGenR
+annMemDecl (Lifted _ i t me _)  = do
+    memDefinition <- definition i t me
+    return $ templateLine PL.<$$> memDefinition
+  where
+    findTypeVars :: K3 Type -> [Identifier]
+    findTypeVars (tag -> TDeclaredVar v) = [v]
+    findTypeVars (children -> []) = []
+    findTypeVars (children -> ts) = concatMap findTypeVars ts
+
+    typeVars = nub $ findTypeVars t
+
+    templateLine = if null typeVars
+        then empty
+        else (text "template" <> angles (sep $ punctuate comma $ map text typeVars))
+
+annMemDecl (Attribute _ i _ _ _) = return $ text i
+annMemDecl (MAnnotation _ i _) = return $ text i
+
+definition :: Identifier -> K3 Type -> Maybe (K3 Expression) -> CPPGenM CPPGenR
+definition i t@(tag &&& children -> (TFunction, [ta, tr])) (Just (tag &&& children -> (ELambda x, [b]))) = do
+    body <- reify RReturn b
+    return $ body
+    cta <- cType ta
+    ctr <- cType tr
+    return $ ctr <+> text i <> parens (cta <+> text x) <+> braces body
+definition i t (Just e) = do
+    newI <- reify (RName i) e
+    d <- cDecl t i
+    return $ newI PL.<//> d
+definition i t Nothing = cDecl t i
+
 program :: K3 Declaration -> CPPGenM CPPGenR
 program d = do
     p <- declaration d
     currentS <- get
     i <- cType T.unit >>= \ctu ->
         return $ ctu <+> text "initGlobalDecls" <> parens empty <+> braces (initializations currentS)
-    return $ vsep [forwards currentS, i, p]
+    let amp = annotationMap currentS
+    compositeDecls <- forM (S.toList $ composites currentS) $ \(S.toList -> als) ->
+        composite (annotationComboId als) [(a, M.findWithDefault [] a amp) | a <- als]
+    return $ vsep $ compositeDecls ++ [forwards currentS, i, p]
